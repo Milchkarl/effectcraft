@@ -334,7 +334,7 @@ fn raw(item: &Item) -> Piece {
         Item::Tok(t) => Piece { ws: t.ws.clone(), body: t.text.clone() },
         Item::Group { open, inner, close } => {
             let mut body = open.text.clone();
-            body.push_str(&rewrite_seq(inner));
+            body.push_str(&rewrite_seq(inner, open.text == "{"));
             if let Some(c) = close {
                 body.push_str(&c.ws);
                 body.push_str(&c.text);
@@ -378,25 +378,7 @@ fn operand(items: &[Item], i: usize) -> Option<(Piece, usize)> {
         };
         return Some((Piece { ws: t.ws.clone(), body }, j));
     }
-    let mut p = raw(first);
-    let mut j = i + 1;
-    // `function name(args) { body }` is one atom.
-    if first.tok().is_some_and(|t| t.is_kw(&["function"])) {
-        if items.get(j).is_some_and(|x| x.is("*")) {
-            push(&mut p, &items[j]);
-            j += 1;
-        }
-        if items.get(j).and_then(Item::tok).is_some_and(|t| t.kind == Kind::Ident) {
-            push(&mut p, &items[j]);
-            j += 1;
-        }
-        for g in ["(", "{"] {
-            if items.get(j).and_then(Item::group) == Some(g) {
-                push(&mut p, &items[j]);
-                j += 1;
-            }
-        }
-    }
+    let (mut p, mut j) = if is_function(first) { function_atom(items, i) } else { (raw(first), i + 1) };
     // Postfix: member access, calls, indexing, tagged templates, `x++`.
     while let Some(it) = items.get(j) {
         let member = it.is(".") || it.is("?.");
@@ -426,6 +408,59 @@ fn operand(items: &[Item], i: usize) -> Option<(Piece, usize)> {
         j = k;
     }
     Some((p, j))
+}
+
+fn is_function(item: &Item) -> bool {
+    item.tok().is_some_and(|t| t.is_kw(&["function"]))
+}
+
+/// `function [*] [name] (args) { body }` from the `function` keyword at `i`, as one atom.
+fn function_atom(items: &[Item], i: usize) -> (Piece, usize) {
+    let Some(first) = items.get(i) else {
+        // Unreachable for callers (they pass a `function` item); still advance so no loop stalls.
+        return (Piece { ws: String::new(), body: String::new() }, i.saturating_add(1));
+    };
+    let mut p = raw(first);
+    let mut j = i + 1;
+    if items.get(j).is_some_and(|x| x.is("*")) {
+        push(&mut p, &items[j]);
+        j += 1;
+    }
+    if items.get(j).and_then(Item::tok).is_some_and(|t| t.kind == Kind::Ident) {
+        push(&mut p, &items[j]);
+        j += 1;
+    }
+    for g in ["(", "{"] {
+        if items.get(j).and_then(Item::group) == Some(g) {
+            push(&mut p, &items[j]);
+            j += 1;
+        }
+    }
+    (p, j)
+}
+
+/// Is the `function` keyword at `i` at the start of a statement, so a function declaration
+/// (ECMAScript: an expression statement cannot start with `function`)? A declaration ends at its
+/// `}`: whatever follows is a new statement, never an operand of it. `stmts` says whether
+/// `items` is a statement list (the whole expression or a `{ … }` block) rather than the inside
+/// of `( … )` or `[ … ]`.
+fn at_statement_start(items: &[Item], i: usize, stmts: bool) -> bool {
+    // `async function`: the statement starts at `async` (no line break may come between them).
+    let is_async = |k: usize| items.get(k).and_then(Item::tok).is_some_and(|a| a.is_kw(&["async"]));
+    let at = match i.checked_sub(1) {
+        Some(k) if is_async(k) && !items.get(i).is_some_and(Item::nl) => k,
+        _ => i,
+    };
+    let Some(prev) = at.checked_sub(1).and_then(|k| items.get(k)) else {
+        return stmts;
+    };
+    match prev {
+        // A block, an `if (…)`/`while (…)` header or a value the line break ends.
+        Item::Group { .. } => true,
+        // Known limit: after a label, `case …:` or `default:` a declaration is still read as an
+        // expression (that `:` cannot be told from an object literal's or a conditional's here).
+        Item::Tok(t) => t.is(";") || t.is_kw(&["else", "do"]) || ends_value(t),
+    }
 }
 
 fn push(p: &mut Piece, item: &Item) {
@@ -510,7 +545,9 @@ fn assignment_end(items: &[Item], i: usize) -> usize {
     j
 }
 
-fn rewrite_seq(items: &[Item]) -> String {
+/// Rewrite a sequence of items. `stmts`: the sequence is a statement list (the whole expression
+/// or the inside of `{ … }`), not the inside of `( … )` or `[ … ]`.
+fn rewrite_seq(items: &[Item], stmts: bool) -> String {
     let mut out = String::new();
     let mut i = 0;
     while i < items.len() {
@@ -521,15 +558,24 @@ fn rewrite_seq(items: &[Item]) -> String {
             i += 2;
             continue;
         }
+        // A function declaration ends at its `}` (#3212): `function f() {}\n-1` is two statements,
+        // so the next line must not become an operand (`__sub(function f() {}, 1)` is NaN).
+        if is_function(it) && at_statement_start(items, i, stmts) {
+            let (p, j) = function_atom(items, i);
+            push_piece(&mut out, p);
+            i = j;
+            continue;
+        }
         if let Some((p, j)) = chain(items, i) {
             // Compound assignment: `x += v` → `x = __add(x, (v))` (the target is evaluated twice,
             // which only matters for targets with side effects).
             if let Some(op) = items.get(j).and_then(Item::tok).filter(|t| t.kind == Kind::Punct && matches!(t.text.as_str(), "+=" | "-=" | "*=" | "/=")) {
                 let end = assignment_end(items, j + 1);
-                let rhs = rewrite_seq(&items[j + 1..end]);
+                let rhs = rewrite_seq(&items[j + 1..end], false);
                 let h = helper(&op.text[..1]).unwrap_or("__add");
+                let target = compound_assignment_target(items, i, j);
                 out.push_str(&p.ws);
-                out.push_str(&format!("{} ={}{h}({}, ({rhs}))", p.body, op.ws, p.body));
+                out.push_str(&format!("{target} ={}{h}({target}, ({rhs}))", op.ws));
                 i = end;
                 continue;
             }
@@ -543,60 +589,293 @@ fn rewrite_seq(items: &[Item]) -> String {
     out
 }
 
+fn raw_ref(item: &Item) -> String {
+    match item {
+        Item::Tok(t) => format!("{}{}", t.ws, t.text),
+        Item::Group { open, inner, close } => {
+            let mut out = format!("{}{}", open.ws, open.text);
+            if has_assign(inner) {
+                // shortcut: nested assignments stay verbatim (rewriting them would double per level), so arithmetic beside them is not array-aware
+                for item in inner {
+                    out.push_str(&raw_ref(item));
+                }
+            } else {
+                out.push_str(&rewrite_seq(inner, open.text == "{"));
+            }
+            if let Some(close) = close {
+                out.push_str(&close.text);
+            }
+            out
+        }
+    }
+}
+
+fn has_assign(items: &[Item]) -> bool {
+    items.iter().any(|it| match it {
+        Item::Tok(t) => ASSIGN.contains(&t.text.as_str()),
+        Item::Group { inner, .. } => has_assign(inner),
+    })
+}
+
 fn push_piece(out: &mut String, p: Piece) {
     out.push_str(&p.ws);
     out.push_str(&p.body);
 }
 
-/// The deepest nesting (brackets, plus chains of prefix operators) an expression may have,
-/// before and after the rewrite (which nests a call per arithmetic operator). The JavaScript
-/// parser recurses per level and a 2 MiB thread overflows its stack (aborting the app) at
-/// about 60 levels, so deeper expressions are rejected with an error instead.
+/// The deepest nesting an expression may have, in levels of brackets, before and after the
+/// rewrite (which nests a call per arithmetic operator). The JavaScript parser and compiler
+/// recurse per level and a 2 MiB thread overflows its stack (aborting the app) at about 75
+/// nested brackets, so deeper expressions are rejected with an error instead. Constructs that
+/// nest without brackets count as part of a level (`too_nested`).
 pub const MAX_NESTING: usize = 32;
+/// Hard limit on bytes emitted by the array-math source rewrite.
+pub const MAX_REWRITTEN_BYTES: usize = 4 * 1024 * 1024;
 
-fn nesting(toks: &[Tok]) -> usize {
-    let (mut depth, mut prefix, mut max) = (0usize, 0usize, 0usize);
-    for t in toks {
-        if t.kind == Kind::Punct && matches!(t.text.as_str(), "(" | "[" | "{") {
-            depth += 1;
-        } else if t.kind == Kind::Punct && matches!(t.text.as_str(), ")" | "]" | "}") {
-            depth = depth.saturating_sub(1);
+fn over_rewrite_limit(text: &str) -> bool {
+    text.len() > MAX_REWRITTEN_BYTES
+}
+
+fn compound_assignment_target(items: &[Item], start: usize, end: usize) -> String {
+    // Rewriting the whole left side duplicates nested computed assignment targets. Keep the
+    // original target syntax for both reads/writes; source length is bounded above.
+    items[start..end].iter().map(raw_ref).collect()
+}
+
+/// Stack cost of one level of brackets (also of a template substitution, a regex group and a
+/// prefix operator, which cost the parser about as much or are never chained in real code).
+const LEVEL: usize = 256;
+/// Stack cost of a construct the parser recurses on without a bracket: `?:`, `=>`, assignments,
+/// `**`, `||`, labels, `if`/`else`/`while`/`for`/`with`/`do` without a block (about 1/8 of a
+/// bracket: 256 of them in a row are allowed; boa overflows from about 750).
+const HEAVY: usize = 32;
+/// Stack cost of a link in a left-deep chain (binary operators, member access, calls, indexing,
+/// the comma operator): the tree is built in a loop but compiled recursively (overflows from
+/// about 3 800 links).
+const LIGHT: usize = 6;
+
+/// One bracket level of `too_nested`'s walk.
+#[derive(Default)]
+struct Level {
+    /// `[`: commas separate elements (a loop in the parser), not operands.
+    array: bool,
+    /// Cost of the chains of the current statement or element.
+    chain: usize,
+    /// Comma operators so far in the current statement.
+    commas: usize,
+    /// `else` branches in a row: `if … else if … else if …` nests even across `;`.
+    elses: usize,
+    /// The next token starts a statement.
+    fresh: bool,
+}
+
+impl Level {
+    fn boundary(&mut self) {
+        self.chain = 0;
+        self.commas = 0;
+        self.fresh = true;
+    }
+}
+
+const ASSIGN: &[&str] = &["=", "+=", "-=", "*=", "/=", "%=", "**=", "<<=", ">>=", ">>>=", "&=", "|=", "^=", "&&=", "||=", "??="];
+
+/// Can `t` end an expression statement (so a line break after it may end the statement)?
+fn ends_value(t: &Tok) -> bool {
+    match t.kind {
+        Kind::Num | Kind::Str | Kind::Template | Kind::Regex => true,
+        Kind::Ident => !t.is_kw(DELIM_KW) && !t.is_kw(PREFIX_KW),
+        Kind::Punct => matches!(t.text.as_str(), ")" | "]" | "}" | "++" | "--"),
+    }
+}
+
+/// Can `t` only start a new statement after a value (automatic semicolon insertion)?
+fn starts_statement(t: &Tok) -> bool {
+    match t.kind {
+        Kind::Num | Kind::Str => true,
+        Kind::Ident => !t.is_kw(&["in", "instanceof", "of"]),
+        Kind::Punct => matches!(t.text.as_str(), "{" | "!" | "~" | "++" | "--"),
+        Kind::Template | Kind::Regex => false,
+    }
+}
+
+/// Bracket depth inside a template literal (its `${…}` substitutions) or a regex (its groups).
+fn inner_depth(text: &str) -> usize {
+    let (mut d, mut max) = (0usize, 0usize);
+    for c in text.chars() {
+        match c {
+            '(' | '[' | '{' => d += 1,
+            ')' | ']' | '}' => d = d.saturating_sub(1),
+            _ => {}
         }
-        let is_prefix = (t.kind == Kind::Punct && matches!(t.text.as_str(), "!" | "~" | "-" | "+")) || t.is_kw(&["typeof", "void", "delete"]);
-        prefix = if is_prefix { prefix + 1 } else { 0 };
-        max = max.max(depth + prefix);
+        max = max.max(d);
     }
     max
 }
 
+/// The code of a template literal's `${…}` substitutions (the outermost ones).
+fn substitutions(template: &str) -> Vec<String> {
+    let c: Vec<char> = template.chars().collect();
+    let mut out = vec![];
+    let mut i = 1;
+    while i < c.len() {
+        match c[i] {
+            '\\' => i += 2,
+            '$' if c.get(i + 1) == Some(&'{') => {
+                let start = i + 2;
+                let (mut j, mut depth) = (start, 0usize);
+                while j < c.len() {
+                    match c[j] {
+                        '{' => depth += 1,
+                        '}' if depth == 0 => break,
+                        '}' => depth -= 1,
+                        '\'' | '"' => {
+                            j = skip_string(&c, j);
+                            continue;
+                        }
+                        '`' => {
+                            j = skip_template(&c, j);
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                out.push(c.get(start..j.min(c.len())).unwrap_or_default().iter().collect());
+                i = j + 1;
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}
+
+/// Whether `toks` nest deeper than [`MAX_NESTING`] levels: an estimate of the parser's stack
+/// use, summing brackets, runs of prefix operators and, per bracket level, the chains of the
+/// current statement (or array element) weighted by what each link costs the parser.
+fn too_nested(toks: &[Tok]) -> bool {
+    too_nested_from(toks, 0)
+}
+
+/// `too_nested` for code that already sits `base` deep (a template substitution).
+fn too_nested_from(toks: &[Tok], base: usize) -> bool {
+    let mut levels = vec![Level::default()];
+    let mut prefix = 0usize;
+    let mut prev: Option<&Tok> = None;
+    for t in toks {
+        let p = t.kind == Kind::Punct;
+        if let Some(l) = levels.last_mut() {
+            if t.nl && prev.is_some_and(ends_value) && starts_statement(t) {
+                l.boundary();
+            }
+            if l.fresh {
+                if !t.is_kw(&["else"]) {
+                    l.elses = 0;
+                }
+                l.fresh = false;
+            }
+        }
+        let mut inner = 0;
+        if p && matches!(t.text.as_str(), "(" | "[" | "{") {
+            // A call or index is a link in its chain too (`f()()()…`).
+            if t.text != "{"
+                && let Some(l) = levels.last_mut()
+            {
+                l.chain = l.chain.saturating_add(LIGHT);
+            }
+            levels.push(Level { array: t.text == "[", ..Level::default() });
+        } else if p && matches!(t.text.as_str(), ")" | "]" | "}") {
+            if levels.len() > 1 {
+                levels.pop();
+            }
+        } else if let Some(l) = levels.last_mut() {
+            if t.is(";") {
+                l.boundary();
+            } else if t.is(",") {
+                l.commas += usize::from(!l.array);
+                l.chain = l.commas.saturating_mul(LIGHT);
+            } else if t.is_kw(&["else"]) {
+                l.elses += 1;
+            } else if (p && (matches!(t.text.as_str(), "?" | ":" | "=>" | "**" | "||") || ASSIGN.contains(&t.text.as_str())))
+                || t.is_kw(&["if", "while", "for", "with", "do"])
+            {
+                l.chain = l.chain.saturating_add(HEAVY);
+            } else if p || t.is_kw(&["in", "instanceof"]) {
+                l.chain = l.chain.saturating_add(LIGHT);
+            } else if matches!(t.kind, Kind::Template | Kind::Regex) {
+                // A tagged template is a link like a call.
+                l.chain = l.chain.saturating_add(LIGHT);
+                inner = inner_depth(&t.text);
+            }
+        }
+        let is_prefix = (p && matches!(t.text.as_str(), "!" | "~" | "-" | "+" | "++" | "--")) || t.is_kw(&["typeof", "void", "delete", "new", "await"]);
+        prefix = if is_prefix { prefix + 1 } else { 0 };
+        let mut cost = (levels.len() - 1 + prefix + inner).saturating_mul(LEVEL).saturating_add(base);
+        for l in &levels {
+            cost = cost.saturating_add(l.chain).saturating_add(l.elses.saturating_mul(HEAVY));
+        }
+        if cost > MAX_NESTING * LEVEL {
+            return true;
+        }
+        // The code inside `${…}` is parsed like any other, one level deeper (the depth check
+        // above bounds this recursion).
+        if t.kind == Kind::Template
+            && t.text.contains("${")
+            && substitutions(&t.text)
+                .iter()
+                .any(|sub| too_nested_from(&tokenize(sub).0, cost.saturating_sub(inner.saturating_mul(LEVEL)).saturating_add(LEVEL)))
+        {
+            return true;
+        }
+        prev = Some(t);
+    }
+    false
+}
+
 /// An error when `src` nests deeper than [`MAX_NESTING`] levels (before or after the rewrite).
 pub fn check_nesting(src: &str) -> Result<(), String> {
+    if over_rewrite_limit(src) {
+        return Err(too_large());
+    }
     let (toks, tail) = tokenize(src);
-    if nesting(&toks) > MAX_NESTING {
+    if too_nested(&toks) {
         return Err(too_deep());
     }
-    let mut out = rewrite_seq(&build(toks));
+    let mut out = rewrite_seq(&build(toks), true);
     out.push_str(&tail);
-    if nesting(&tokenize(&out).0) > MAX_NESTING {
+    if over_rewrite_limit(&out) {
+        return Err(too_large());
+    }
+    if too_nested(&tokenize(&out).0) {
         return Err(too_deep());
     }
     Ok(())
 }
 
+/// An error when plain JavaScript `src` (not rewritten: what `eval` and `Function` get at run
+/// time) nests deeper than [`MAX_NESTING`] levels.
+pub fn check_plain_nesting(src: &str) -> Result<(), String> {
+    if too_nested(&tokenize(src).0) { Err(too_deep()) } else { Ok(()) }
+}
+
 fn too_deep() -> String {
-    format!("Error: expression is nested too deeply (more than {MAX_NESTING} levels of brackets or chained operators)")
+    format!("Error: expression is nested too deeply (more than {MAX_NESTING} levels of brackets, or too long a chain of operators)")
 }
 
 /// Rewrite an expression's source for array-aware arithmetic. Line breaks are preserved.
 /// An expression nested deeper than [`MAX_NESTING`] becomes a `throw` of that error.
 pub fn rewrite(src: &str) -> String {
+    if over_rewrite_limit(src) {
+        return throw_too_large();
+    }
     let (toks, tail) = tokenize(src);
-    if nesting(&toks) > MAX_NESTING {
+    if too_nested(&toks) {
         return throw_too_deep();
     }
-    let mut out = rewrite_seq(&build(toks));
+    let mut out = rewrite_seq(&build(toks), true);
     out.push_str(&tail);
-    if nesting(&tokenize(&out).0) > MAX_NESTING {
+    if over_rewrite_limit(&out) {
+        return throw_too_large();
+    }
+    if too_nested(&tokenize(&out).0) {
         return throw_too_deep();
     }
     out
@@ -604,6 +883,14 @@ pub fn rewrite(src: &str) -> String {
 
 fn throw_too_deep() -> String {
     format!("throw new RangeError({:?})", too_deep().trim_start_matches("Error: "))
+}
+
+fn too_large() -> String {
+    format!("Error: expression exceeds the {MAX_REWRITTEN_BYTES}-byte rewrite limit")
+}
+
+fn throw_too_large() -> String {
+    format!("throw new RangeError({:?})", too_large().trim_start_matches("Error: "))
 }
 
 #[cfg(test)]
@@ -646,11 +933,47 @@ mod tests {
     #[test]
     fn compound_assignment_and_functions() {
         assert_eq!(n(&rewrite("x += [1, 0];")), n("x = __add(x, ( [1, 0]));"));
+        assert_eq!(n(&rewrite("obj[key] += 1")), n("obj[key] = __add(obj[key], (1))"));
+        assert_eq!(n(&rewrite("o[a + b] += 1")), n("o[__add(a, b)] = __add(o[__add(a, b)], (1))"));
         assert_eq!(n(&rewrite("function f(a) { return a * 2 }")), n("function f(a) { return __mul(a,  2) }"));
         assert_eq!(n(&rewrite("var g = (a) => a - 1")), n("var g = (a) => __sub(a,  1)"));
         assert_eq!(n(&rewrite("typeof a + 'x'")), n("__add(typeof a,  'x')"));
         assert_eq!(n(&rewrite("i++ + 1")), n("__add(i++,  1)"));
         assert_eq!(n(&rewrite("2 ** 3 * 2")), n("__mul(2 ** 3,  2)"));
+    }
+
+    #[test]
+    fn a_function_declaration_is_not_an_operand_of_the_next_statement() {
+        // #3212: a declaration ends at its `}` (an expression statement cannot start with
+        // `function`), so a following `-`, `+` or `[` starts a new statement.
+        assert_eq!(n(&rewrite("function f(x){ return x; }\n-50 + 100")), n("function f(x){ return x; }\n__add(-50, 100)"));
+        assert_eq!(n(&rewrite("function f(){}\n+a - b")), n("function f(){}\n__sub(+a, b)"));
+        assert_eq!(n(&rewrite("function f(){}\n[1, 2] - [1, 1]")), n("function f(){}\n__sub([1, 2], [1, 1])"));
+        assert_eq!(n(&rewrite("function f(){}\n(a) - b")), n("function f(){}\n__sub((a), b)"));
+        assert_eq!(n(&rewrite("function* g(){} -x")), n("function* g(){} __neg(x)"));
+        assert_eq!(n(&rewrite("async function f(){}\n-x")), n("async function f(){}\n__neg(x)"));
+        assert_eq!(n(&rewrite("var a = 1;function f(){}\n-x")), n("var a = 1;function f(){}\n__neg(x)"));
+        assert_eq!(n(&rewrite("if (a) { function f(){}\n-b }")), n("if (a) { function f(){}\n__neg(b) }"));
+        // Function expressions stay operands, whatever follows on the next line.
+        assert_eq!(n(&rewrite("x = function(a){ return a } - 1")), n("x = __sub(function(a){ return a }, 1)"));
+        assert_eq!(n(&rewrite("var g = function(){}\n- 1")), n("var g = __sub(function(){},\n 1)"));
+        assert_eq!(n(&rewrite("(function f(){} - 1)")), n("(__sub(function f(){}, 1))"));
+        assert_eq!(n(&rewrite("[function(){} - 1]")), n("[__sub(function(){}, 1)]"));
+        assert_eq!(n(&rewrite("o = {k: function(){} - 1}")), n("o = {k: __sub(function(){}, 1)}"));
+    }
+
+    #[test]
+    fn source_expansion_is_bounded_before_rewriting() {
+        let src = "x += 1;".repeat(super::MAX_REWRITTEN_BYTES / 6 + 1);
+        assert!(check_nesting(&src).unwrap_err().contains("rewrite limit"));
+        assert!(rewrite(&src).starts_with("throw new RangeError("));
+    }
+
+    #[test]
+    fn output_expansion_is_bounded() {
+        let src = format!("{} += 1", "a".repeat(super::MAX_REWRITTEN_BYTES / 2));
+        assert!(check_nesting(&src).unwrap_err().contains("rewrite limit"));
+        assert!(rewrite(&src).starts_with("throw new RangeError("));
     }
 
     #[test]
@@ -672,5 +995,61 @@ mod tests {
         assert!(check_nesting(&ok).is_ok());
         assert!(crate::check_syntax(&ok).is_ok());
         assert!(check_nesting(&vec!["x"; 20].join(" + ")).is_ok());
+    }
+
+    #[test]
+    fn long_chains_without_brackets_are_an_error_not_a_stack_overflow() {
+        // Found by the expression fuzzer (#786): the parser also recurses on chains that need no
+        // bracket, so a few hundred `?:`, `=>` or `if`, or a few thousand `.`/`<`/`()` links,
+        // aborted the app with a stack overflow; so did 75 nested template substitutions or
+        // regex groups (both hidden inside one token), and 6 000 prefix `new`/`++` the rewriter.
+        let chains: [(&str, &str); 19] = [
+            ("x?x:", ""),
+            ("()=>", ""),
+            ("a=>", ""),
+            ("if(x)", ""),
+            ("if(x)x;else ", ""),
+            ("x=", ""),
+            ("x**", ""),
+            ("x||", ""),
+            ("x<", ""),
+            ("x,", ""),
+            ("x.y", ""),
+            ("f()", ""),
+            ("a:", ""),
+            ("new ", ""),
+            ("++", ""),
+            ("`${", "}`"),
+            ("s.replace(/(", ")/, '')"),
+            ("`${x??", "}`"),
+            ("{a:", "}"),
+        ];
+        for (open, close) in chains {
+            for n in [2_000, 100_000] {
+                let src = open.repeat(n) + "1" + &close.repeat(n);
+                assert!(rewrite(&src).starts_with("throw new RangeError("), "{open} × {n}");
+                assert!(crate::check_syntax(&src).unwrap_err().contains("nested too deeply"), "{open} × {n}");
+            }
+        }
+        // A chain inside one template substitution (the template is one token to the rewriter).
+        let src = format!("`${{{}1}}`", "x??".repeat(100_000));
+        assert!(crate::check_syntax(&src).unwrap_err().contains("nested too deeply"));
+    }
+
+    #[test]
+    fn long_real_expressions_still_parse() {
+        let lines = |n: usize, line: &str| vec![line; n].join("\n");
+        let else_ifs = (0..200).map(|i| format!("if (time < {i}) {i}; else ")).collect::<String>() + "0";
+        let numbers = format!("[{}][0]", (0..5000).map(|i| i.to_string()).collect::<Vec<_>>().join(", "));
+        let points = format!("createPath([{}], [], [], true)", (0..500).map(|i| format!("[{i}, {}]", i * 2)).collect::<Vec<_>>().join(", "));
+        let object = format!("var o = {{{}}}; o.k0", (0..200).map(|i| format!("k{i}: time > {i} ? {i} : -{i}")).collect::<Vec<_>>().join(", "));
+        let program = "var x = 0\n".to_string() + &lines(300, "x = x + thisComp.layer(1).transform.position[0] * 2 - 1") + "\nx";
+        let ifs = "var y = 0\n".to_string() + &lines(300, "if (time > 1) y = y + 1") + "\ny";
+        let chained = vec!["thisComp.layer(1).transform.position.valueAtTime(time - 0.1)[0]"; 30].join(" + ");
+        let template = "`${thisLayer.name}: ${Math.floor(time * 10) / 10} s, ${`${index}`} {}`".to_string();
+        for src in [else_ifs, numbers, points, object, program, ifs, chained, template] {
+            assert!(check_nesting(&src).is_ok(), "{}", &src[..80]);
+            assert!(crate::check_syntax(&src).is_ok(), "{}", &src[..80]);
+        }
     }
 }

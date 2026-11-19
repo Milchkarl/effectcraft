@@ -42,6 +42,16 @@ impl ShapePath {
     pub fn len(&self) -> usize {
         self.vertices.len()
     }
+    /// Give both tangent arrays one entry per vertex: missing tangents become zero (a corner),
+    /// extra ones are dropped. The three arrays are read independently from a project file, so a
+    /// loaded path can disagree with itself (#1250). Returns whether anything changed.
+    pub fn fit_tangents(&mut self) -> bool {
+        let n = self.vertices.len();
+        let changed = self.in_tangents.len() != n || self.out_tangents.len() != n;
+        self.in_tangents.resize(n, [0.0; 2]);
+        self.out_tangents.resize(n, [0.0; 2]);
+        changed
+    }
     /// Number of segments (vertex to next vertex, the closing one included).
     pub fn segment_count(&self) -> usize {
         let n = self.vertices.len();
@@ -72,7 +82,18 @@ impl ShapePath {
             if i == 0 && f.segment == 0 && !self.closed {
                 return false;
             }
-            if i > 0 && f.segment == i - 1 {
+            if i == 0 && self.closed && segs > 0 {
+                // The old closing segment and segment 0 merge into the new closing one.
+                if f.segment == segs {
+                    f.segment = segs - 1;
+                    f.t *= 0.5;
+                } else if f.segment == 0 {
+                    f.segment = segs - 1;
+                    f.t = 0.5 + f.t * 0.5;
+                } else {
+                    f.segment -= 1;
+                }
+            } else if i > 0 && f.segment == i - 1 {
                 f.t *= 0.5;
             } else if f.segment == i && i > 0 {
                 f.segment = i - 1;
@@ -169,9 +190,33 @@ impl Gradient {
         let a = sample_stops(&self.opacities, t, |a, b, f| a + (b - a) * f as f32).unwrap_or(1.0);
         [col[0], col[1], col[2], col[3] * a]
     }
+
+    /// The colour stops alone at `t` (0..1), RGBA as stored: unlike [`Gradient::sample`], the
+    /// opacity stops are not applied. A new colour stop takes this value.
+    pub fn color_at(&self, t: f64) -> [f32; 4] {
+        sample_stops(&self.colors, t.clamp(0.0, 1.0), |a, b, f| {
+            let mut o = [0.0; 4];
+            for i in 0..4 {
+                o[i] = a[i] + (b[i] - a[i]) * f as f32;
+            }
+            o
+        })
+        .unwrap_or([1.0; 4])
+    }
+
+    /// The opacity stops alone at `t` (0..1). A new opacity stop takes this value.
+    pub fn opacity_at(&self, t: f64) -> f32 {
+        sample_stops(&self.opacities, t.clamp(0.0, 1.0), |a, b, f| a + (b - a) * f as f32).unwrap_or(1.0)
+    }
 }
 
+/// Most stops (colour or opacity) a gradient is sampled through. Gradients are sampled per
+/// pixel, so the stop count multiplies every painted pixel's work: stops past this are ignored
+/// when sampling, and a gradient written as JSON with more is refused.
+pub const MAX_GRADIENT_STOPS: usize = 256;
+
 fn sample_stops<T: Copy>(stops: &[(f64, T)], t: f64, lerp: impl Fn(T, T, f64) -> T) -> Option<T> {
+    let stops = &stops[..stops.len().min(MAX_GRADIENT_STOPS)];
     let first = stops.first()?;
     if t <= first.0 {
         return Some(first.1);
@@ -204,7 +249,7 @@ fn gradient_json(j: &serde_json::Value) -> Option<Gradient> {
     }
     fn stops(a: &[J]) -> Option<Vec<(f64, [f32; 4])>> {
         let n = a.len();
-        if n < 2 {
+        if !(2..=MAX_GRADIENT_STOPS).contains(&n) {
             return None;
         }
         a.iter()
@@ -220,6 +265,7 @@ fn gradient_json(j: &serde_json::Value) -> Option<Gradient> {
         J::Object(o) => {
             let colors = stops(o.get("colors")?.as_array()?)?;
             let op = match o.get("opacities") {
+                Some(J::Array(a)) if a.len() > MAX_GRADIENT_STOPS => return None,
                 Some(J::Array(a)) => Some(
                     a.iter()
                         .map(|s| {
@@ -430,9 +476,10 @@ impl Value {
             }
             Value::Layer(_) => Some(Value::Layer(j.as_u64())),
             Value::Path(_) => serde_json::from_value::<ShapePath>(j.clone()).ok().map(Value::Path).or_else(|| serde_json::from_value::<Value>(j.clone()).ok()),
-            Value::Gradient(_) => {
-                serde_json::from_value::<Value>(j.clone()).ok().filter(|v| matches!(v, Value::Gradient(_))).or_else(|| gradient_json(j).map(Value::Gradient))
-            }
+            Value::Gradient(_) => serde_json::from_value::<Value>(j.clone())
+                .ok()
+                .filter(|v| matches!(v, Value::Gradient(g) if g.colors.len() <= MAX_GRADIENT_STOPS && g.opacities.len() <= MAX_GRADIENT_STOPS))
+                .or_else(|| gradient_json(j).map(Value::Gradient)),
         }
     }
     /// JSON for display/automation (numbers/arrays for numeric kinds).
