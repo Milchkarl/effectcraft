@@ -7,10 +7,6 @@ name: CI (macOS)
 # On pushes to main, not on every pull request: macOS runners are scarce. A newer push cancels the
 # older run, so main is checked at its latest commit. Pull requests that change this file run it.
 on:
-  push:
-    branches: [main]
-  pull_request:
-    paths: [.github/workflows/ci-macos.yml]
   workflow_dispatch:
 
 permissions:
